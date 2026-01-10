@@ -1,14 +1,25 @@
 /**
  * Jellyfin NFO Plugin
- * Parses Jellyfin/Kodi NFO files for movies and TV shows
+ *
+ * Parses Jellyfin/Kodi NFO files for movies and TV shows.
+ *
+ * Matches old JellyFinNfoProcessor output:
+ * - videoType, originalTitle, titles/{lang}
+ * - episode, season, movieYear
+ * - rating, anidbid, imdbid, tmdbid, mpaa, criticrating, releasedate
+ * - art/fanart, art/poster
+ * - languages (add), genres (add), studio (add), plot/{lang}, tags (add)
  */
 
 import { readFile, access } from 'fs/promises';
 import { dirname, join } from 'path';
 import { Parser } from 'xml2js';
 import { franc } from 'franc-min';
+import { anyTo_iso_639_3 } from '@metazla/filename-tools';
 import type { PluginManifest, ProcessRequest, CallbackPayload } from './types.js';
 import { MetaCoreClient } from './meta-core-client.js';
+
+const englishIsoCode = 'eng';
 
 export const manifest: PluginManifest = {
     id: 'jellyfin-nfo',
@@ -30,6 +41,9 @@ export const manifest: PluginManifest = {
         rating: { label: 'Rating', type: 'string' },
         imdbid: { label: 'IMDB ID', type: 'string' },
         tmdbid: { label: 'TMDB ID', type: 'string' },
+        anidbid: { label: 'AniDB ID', type: 'string' },
+        'art/poster': { label: 'Poster CID', type: 'cid' },
+        'art/fanart': { label: 'Fanart CID', type: 'cid' },
     },
     config: {},
 };
@@ -66,6 +80,7 @@ export async function process(
     try {
         const { cid, filePath, existingMeta } = request;
 
+        // Only process video files
         if (existingMeta?.fileType !== 'video') {
             await sendCallback({
                 taskId: request.taskId,
@@ -76,43 +91,34 @@ export async function process(
             return;
         }
 
-        const metadata: Record<string, string> = {};
-        const sets: Array<{ key: string; value: string }> = [];
-
-        // Try file-specific NFO
+        // Try file-specific NFO first
         const nfoPath = filePath.replace(/\.[^.]+$/, '.nfo');
         if (await fileExists(nfoPath)) {
             try {
-                const parsed = await parseNfoFile(nfoPath);
-                const root = parsed.episodedetails || parsed.movie || parsed.tvshow;
-                if (root) {
-                    extractNfoData(root, metadata, sets, parsed.movie ? 'movie' : 'tvshow');
-                }
-            } catch (e) {
-                console.log(`[jellyfin-nfo] Error parsing ${nfoPath}`);
+                const nfoContent = await readFile(nfoPath, 'utf8');
+                const parser = new Parser({ explicitArray: false, mergeAttrs: true });
+                const parsed = await parser.parseStringPromise(nfoContent);
+                await extractNfoData(metaCore, cid, parsed, filePath);
+            } catch (error) {
+                console.debug(`[jellyfin-nfo] Error parsing file NFO ${nfoPath}: ${error}`);
             }
         }
 
-        // Try tvshow.nfo in directory
-        const tvshowNfo = join(dirname(filePath), 'tvshow.nfo');
-        if (await fileExists(tvshowNfo)) {
+        // Then try folder-level NFO (tvshow.nfo)
+        const dirPath = dirname(filePath);
+        const tvShowNfoPath = join(dirPath, 'tvshow.nfo');
+        if (await fileExists(tvShowNfoPath)) {
             try {
-                const parsed = await parseNfoFile(tvshowNfo);
-                if (parsed.tvshow) {
-                    extractNfoData(parsed.tvshow, metadata, sets, 'tvshow');
-                }
-            } catch (e) {
-                console.log(`[jellyfin-nfo] Error parsing ${tvshowNfo}`);
+                const nfoContent = await readFile(tvShowNfoPath, 'utf8');
+                const parser = new Parser({ explicitArray: false, mergeAttrs: true });
+                const parsed = await parser.parseStringPromise(nfoContent);
+                await extractNfoData(metaCore, cid, parsed, filePath);
+            } catch (error) {
+                console.debug(`[jellyfin-nfo] Error parsing folder NFO ${tvShowNfoPath}: ${error}`);
             }
         }
 
-        if (Object.keys(metadata).length > 0) {
-            await metaCore.mergeMetadata(cid, metadata);
-        }
-
-        for (const { key, value } of sets) {
-            await metaCore.addToSet(cid, key, value);
-        }
+        console.log(`[jellyfin-nfo] Processed NFO for ${filePath}`);
 
         await sendCallback({
             taskId: request.taskId,
@@ -129,41 +135,133 @@ export async function process(
     }
 }
 
-function extractNfoData(
-    root: any,
-    metadata: Record<string, string>,
-    sets: Array<{ key: string; value: string }>,
-    videoType: string
-): void {
-    metadata.videoType = videoType;
+/**
+ * Extract data from parsed NFO
+ */
+async function extractNfoData(
+    metaCore: MetaCoreClient,
+    cid: string,
+    parsed: any,
+    filePath: string
+): Promise<void> {
+    // Find the root element (episodedetails, movie, or tvshow)
+    const root = parsed.episodedetails || parsed.movie || parsed.tvshow;
+    if (!root) {
+        return;
+    }
 
-    if (root.originaltitle) metadata.originalTitle = root.originaltitle;
-    if (root.title && !metadata.originalTitle) metadata.originalTitle = root.title;
-    if (root.episode) metadata.episode = String(root.episode);
-    if (root.season) metadata.season = String(root.season);
-    if (root.year) metadata.movieYear = String(root.year);
-    if (root.rating) metadata.rating = String(root.rating);
-    if (root.imdbid) metadata.imdbid = root.imdbid;
-    if (root.tmdbid) metadata.tmdbid = String(root.tmdbid);
-    if (root.anidbid) metadata.anidbid = String(root.anidbid);
-    if (root.mpaa) metadata.mpaa = root.mpaa;
-    if (root.releasedate) metadata.releasedate = root.releasedate;
+    // Determine video type
+    const videoType = parsed.movie ? 'movie' : 'tvshow';
+    await metaCore.setProperty(cid, 'videoType', videoType);
 
-    // Plot with language detection
+    // Basic metadata
+    if (root.originaltitle) {
+        await metaCore.setProperty(cid, 'originalTitle', root.originaltitle);
+        const lang = anyTo_iso_639_3(root.language) || englishIsoCode;
+        await metaCore.setProperty(cid, `titles/${lang}`, root.originaltitle);
+        await metaCore.addToSet(cid, 'languages', lang);
+    }
+
+    if (root.title) {
+        const lang = anyTo_iso_639_3(root.language) || englishIsoCode;
+        // Only set if not already set via originaltitle
+        await metaCore.setProperty(cid, `titles/${lang}`, root.title);
+        await metaCore.addToSet(cid, 'languages', lang);
+    }
+
+    // Episode/Season info
+    try {
+        if (root.episode && parseInt(root.episode) > 0) {
+            await metaCore.setProperty(cid, 'episode', String(root.episode));
+        }
+    } catch (e) {
+        console.debug(`[jellyfin-nfo] Error parsing episode: ${e}`);
+    }
+
+    try {
+        if (root.season && parseInt(root.season) > 0) {
+            await metaCore.setProperty(cid, 'season', String(root.season));
+        }
+    } catch (e) {
+        console.debug(`[jellyfin-nfo] Error parsing season: ${e}`);
+    }
+
+    // Year (movieYear)
+    if (root.year) await metaCore.setProperty(cid, 'movieYear', String(root.year));
+    if (root.rating) await metaCore.setProperty(cid, 'rating', String(root.rating));
+    if (root.anidbid) await metaCore.setProperty(cid, 'anidbid', String(root.anidbid));
+    if (root.imdbid) await metaCore.setProperty(cid, 'imdbid', String(root.imdbid));
+    if (root.tmdbid) await metaCore.setProperty(cid, 'tmdbid', String(root.tmdbid));
+    if (root.mpaa) await metaCore.setProperty(cid, 'mpaa', String(root.mpaa));
+    if (root.criticrating) await metaCore.setProperty(cid, 'criticrating', String(root.criticrating));
+    if (root.releasedate) await metaCore.setProperty(cid, 'releasedate', String(root.releasedate));
+
+    // Art (poster and fanart) - compute CIDs using meta-core API
+    if (root.art?.poster) {
+        try {
+            const posterCid = await metaCore.computeFileCID(root.art.poster);
+            if (posterCid) await metaCore.setProperty(cid, 'art/poster', posterCid);
+        } catch (e) {
+            console.debug(`[jellyfin-nfo] Error getting poster CID: ${e}`);
+        }
+    }
+    if (root.art?.fanart) {
+        try {
+            const fanartCid = await metaCore.computeFileCID(root.art.fanart);
+            if (fanartCid) await metaCore.setProperty(cid, 'art/fanart', fanartCid);
+        } catch (e) {
+            console.debug(`[jellyfin-nfo] Error getting fanart CID: ${e}`);
+        }
+    }
+
+    // Languages (add from root.language)
+    if (root.language) {
+        await metaCore.addToSet(cid, 'languages', String(root.language));
+    }
+
+    // Genres (add)
+    try {
+        const genres = normalizeArray(root.genre);
+        for (const genre of genres) {
+            await metaCore.addToSet(cid, 'genres', String(genre));
+        }
+    } catch (e) {
+        console.debug(`[jellyfin-nfo] Error parsing genres: ${e}`);
+    }
+
+    // Studios (add)
+    try {
+        const studios = normalizeArray(root.studio);
+        for (const studio of studios) {
+            await metaCore.addToSet(cid, 'studio', String(studio));
+        }
+    } catch (e) {
+        console.debug(`[jellyfin-nfo] Error parsing studios: ${e}`);
+    }
+
+    // Tags (add)
+    try {
+        const tags = normalizeArray(root.tag || root.tags);
+        for (const tag of tags) {
+            await metaCore.addToSet(cid, 'tags', String(tag));
+        }
+    } catch (e) {
+        console.debug(`[jellyfin-nfo] Error parsing tags: ${e}`);
+    }
+
+    // Plot
     if (root.plot) {
-        const lang = franc(root.plot);
-        const langKey = lang && lang !== 'und' ? lang : 'eng';
-        metadata[`plot/${langKey}`] = root.plot;
+        try {
+            const plotLang = franc(root.plot);
+            if (plotLang && plotLang !== 'und') {
+                await metaCore.setProperty(cid, `plot/${plotLang}`, root.plot);
+            } else {
+                await metaCore.setProperty(cid, `plot/${englishIsoCode}`, root.plot);
+            }
+        } catch (e) {
+            await metaCore.setProperty(cid, `plot/${englishIsoCode}`, root.plot);
+        }
     }
 
-    // Sets
-    for (const genre of normalizeArray(root.genre)) {
-        sets.push({ key: 'genres', value: genre });
-    }
-    for (const studio of normalizeArray(root.studio)) {
-        sets.push({ key: 'studio', value: studio });
-    }
-    for (const tag of normalizeArray(root.tag || root.tags)) {
-        sets.push({ key: 'tags', value: tag });
-    }
+    console.debug(`[jellyfin-nfo] Extracted NFO data for ${filePath}`);
 }
