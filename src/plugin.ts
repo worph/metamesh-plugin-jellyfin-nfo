@@ -18,6 +18,15 @@ import { franc } from 'franc-min';
 import { anyTo_iso_639_3 } from '@metazla/filename-tools';
 import type { PluginManifest, ProcessRequest, CallbackPayload } from './types.js';
 import { MetaCoreClient } from './meta-core-client.js';
+import { createWebDAVClient, WebDAVClient } from './webdav-client.js';
+
+// Initialize WebDAV client if WEBDAV_URL is set
+const webdavClient = createWebDAVClient();
+if (webdavClient) {
+    console.log('[jellyfin-nfo] Using WebDAV for file access');
+} else {
+    console.log('[jellyfin-nfo] Using direct filesystem access');
+}
 
 const englishIsoCode = 'eng';
 
@@ -49,6 +58,9 @@ export const manifest: PluginManifest = {
 };
 
 async function fileExists(path: string): Promise<boolean> {
+    if (webdavClient) {
+        return webdavClient.exists(path);
+    }
     try {
         await access(path);
         return true;
@@ -57,8 +69,15 @@ async function fileExists(path: string): Promise<boolean> {
     }
 }
 
+async function readNfoContent(nfoPath: string): Promise<string> {
+    if (webdavClient) {
+        return webdavClient.readText(nfoPath, 'utf8');
+    }
+    return readFile(nfoPath, 'utf8');
+}
+
 async function parseNfoFile(nfoPath: string): Promise<any> {
-    const content = await readFile(nfoPath, 'utf8');
+    const content = await readNfoContent(nfoPath);
     const parser = new Parser({ explicitArray: false, mergeAttrs: true });
     return parser.parseStringPromise(content);
 }
@@ -95,7 +114,7 @@ export async function process(
         const nfoPath = filePath.replace(/\.[^.]+$/, '.nfo');
         if (await fileExists(nfoPath)) {
             try {
-                const nfoContent = await readFile(nfoPath, 'utf8');
+                const nfoContent = await readNfoContent(nfoPath);
                 const parser = new Parser({ explicitArray: false, mergeAttrs: true });
                 const parsed = await parser.parseStringPromise(nfoContent);
                 await extractNfoData(metaCore, cid, parsed, filePath);
@@ -109,7 +128,7 @@ export async function process(
         const tvShowNfoPath = join(dirPath, 'tvshow.nfo');
         if (await fileExists(tvShowNfoPath)) {
             try {
-                const nfoContent = await readFile(tvShowNfoPath, 'utf8');
+                const nfoContent = await readNfoContent(tvShowNfoPath);
                 const parser = new Parser({ explicitArray: false, mergeAttrs: true });
                 const parsed = await parser.parseStringPromise(nfoContent);
                 await extractNfoData(metaCore, cid, parsed, filePath);
@@ -118,7 +137,8 @@ export async function process(
             }
         }
 
-        console.log(`[jellyfin-nfo] Processed NFO for ${filePath}`);
+        const mode = webdavClient ? 'WebDAV' : 'filesystem';
+        console.log(`[jellyfin-nfo] Processed NFO for ${filePath} (${mode})`);
 
         await sendCallback({
             taskId: request.taskId,
