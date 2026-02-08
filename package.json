@@ -1,6 +1,7 @@
 {
   "name": "@metazla/plugin-jellyfin-nfo",
   "version": "1.0.0",
+  "packageManager": "pnpm@10.28.0",
   "description": "MetaMesh plugin: Parses Jellyfin/Kodi NFO files",
   "type": "module",
   "main": "dist/index.js",
