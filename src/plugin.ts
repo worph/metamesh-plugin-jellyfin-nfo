@@ -4,7 +4,7 @@
  * Parses Jellyfin/Kodi NFO files for movies and TV shows.
  *
  * Matches old JellyFinNfoProcessor output:
- * - videoType, originalTitle, titles/{lang}
+ * - videoType, originalTitle, titles/<lang3>/<name> (key-set: title + originaltitle)
  * - episode, season, movieYear
  * - rating, anidbid, imdbid, tmdbid, mpaa, criticrating, releasedate
  * - art/fanart, art/poster
@@ -29,6 +29,16 @@ if (webdavClient) {
 }
 
 const englishIsoCode = 'eng';
+
+/**
+ * `titles/<lang3>/<name>` key-set member key (METADATA_KEYS.md §3): trimmed,
+ * whitespace collapsed, `/` (the key-set separator) written as U+2215 `∕`.
+ * `undefined` when nothing is left to name.
+ */
+function titleMemberKey(lang3: string, name: unknown): string | undefined {
+    const clean = (typeof name === 'string' ? name : '').trim().replace(/\s+/g, ' ').replace(/\//g, '\u2215');
+    return clean ? `titles/${lang3}/${clean}` : undefined;
+}
 
 export const manifest: PluginManifest = {
     id: 'jellyfin-nfo',
@@ -177,16 +187,22 @@ async function extractNfoData(
     // Basic metadata
     if (root.originaltitle) {
         await metaCore.setProperty(cid, 'originalTitle', root.originaltitle);
-        const lang = anyTo_iso_639_3(root.language) || englishIsoCode;
-        await metaCore.setProperty(cid, `titles/${lang}`, root.originaltitle);
-        await metaCore.addToSet(cid, 'languages', lang);
     }
 
-    if (root.title) {
-        const lang = anyTo_iso_639_3(root.language) || englishIsoCode;
-        // Only set if not already set via originaltitle
-        await metaCore.setProperty(cid, `titles/${lang}`, root.title);
-        await metaCore.addToSet(cid, 'languages', lang);
+    // Both names are `titles/<lang3>/<name>` key-set members (METADATA_KEYS.md
+    // §3). An NFO without a <language> files them under `und` — the language of
+    // a name is not guessed — and adds nothing to `languages`.
+    const nfoLang = anyTo_iso_639_3(root.language);
+    const nameMembers: Record<string, string> = {};
+    for (const name of [root.originaltitle, root.title]) {
+        const key = titleMemberKey(nfoLang || 'und', name);
+        if (key) nameMembers[key] = 'true';
+    }
+    if (Object.keys(nameMembers).length > 0) {
+        await metaCore.mergeMetadata(cid, nameMembers);
+        if (nfoLang) {
+            await metaCore.addToSet(cid, 'languages', nfoLang);
+        }
     }
 
     // Episode/Season info
