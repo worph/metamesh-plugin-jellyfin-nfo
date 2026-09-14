@@ -31,6 +31,35 @@ if (webdavClient) {
 const englishIsoCode = 'eng';
 
 /**
+ * ISO 639-2/T (= 639-3) → 639-2/**B** for the codes where they differ. The
+ * release tier (`languages/*`, METADATA_KEYS.md §"Value formats") is /B —
+ * `fre`, not `fra` — because that is what every `languages:` filter compares
+ * against literally. `anyTo_iso_639_3` targets /T, so its output has to be
+ * folded before it becomes a `languages/` member or a `fra` member would simply
+ * never match a `fre` query. Mirrors `metamesh-plugin-language`'s table.
+ *
+ * (The `titles/<lang3>/…` keys below are NOT folded here — the card tier is
+ * still on /T across every writer, and converging it is a separate pass.
+ * METADATA_KEYS.md §14.3.)
+ */
+const T2B: Record<string, string> = {
+    fra: 'fre', deu: 'ger', zho: 'chi', nld: 'dut', ell: 'gre', ron: 'rum',
+    slk: 'slo', ces: 'cze', fas: 'per', msa: 'may', isl: 'ice', kat: 'geo',
+    mkd: 'mac', cym: 'wel', eus: 'baq', mya: 'bur', hye: 'arm', sqi: 'alb',
+};
+
+/**
+ * The `languages/<lang3>` member for an NFO `<language>` value, or `undefined`
+ * when there is nothing usable. `und` is never a member (§9).
+ */
+function unionLangMember(raw: unknown): string | undefined {
+    const iso3 = anyTo_iso_639_3(raw as string);
+    if (!iso3) return undefined;
+    const code = (T2B[iso3] ?? iso3).toLowerCase();
+    return /^[a-z]{3}$/.test(code) && code !== 'und' ? `languages/${code}` : undefined;
+}
+
+/**
  * `titles/<lang3>/<name>` key-set member key (METADATA_KEYS.md §3): trimmed,
  * whitespace collapsed, `/` (the key-set separator) written as U+2215 `∕`.
  * `undefined` when nothing is left to name.
@@ -200,9 +229,9 @@ async function extractNfoData(
     }
     if (Object.keys(nameMembers).length > 0) {
         await metaCore.mergeMetadata(cid, nameMembers);
-        if (nfoLang) {
-            await metaCore.addToSet(cid, 'languages', nfoLang);
-        }
+        // The `languages/` member is written once, in the Languages block below
+        // — it fires on the same `<language>` element and does not depend on a
+        // name having survived the trim.
     }
 
     // Episode/Season info
@@ -250,9 +279,14 @@ async function extractNfoData(
         }
     }
 
-    // Languages (add from root.language)
+    // Languages: a `languages/<lang3>` key-set member (METADATA_KEYS.md §9), not
+    // the legacy flat field. `addToSet` mutates a single joined string, which is
+    // the shape §14.12 is migrating away from — it cannot merge across peers and
+    // it bypassed normalization entirely here, writing the raw NFO text (`en`,
+    // `English`) straight into a field whose vocabulary is 3-letter /B.
     if (root.language) {
-        await metaCore.addToSet(cid, 'languages', String(root.language));
+        const member = unionLangMember(root.language);
+        if (member) await metaCore.mergeMetadata(cid, { [member]: 'true' });
     }
 
     // Genres (add)
